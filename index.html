@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="description" content="SafeCircle — plan safer routes, check in with people you trust, and get real-time safety alerts for your area." />
+    <meta name="theme-color" content="#2F5D42" media="(prefers-color-scheme: light)" />
+    <meta name="theme-color" content="#10130F" media="(prefers-color-scheme: dark)" />
+    <meta property="og:title" content="SafeCircle — walk with confidence" />
+    <meta property="og:description" content="Plan safer routes, check in with people you trust, and get real-time safety alerts for your area." />
+    <meta property="og:type" content="website" />
+    <meta property="og:image" content="/favicon.svg" />
+    <meta name="twitter:card" content="summary" />
+    <meta name="twitter:title" content="SafeCircle — walk with confidence" />
+    <meta name="twitter:description" content="Plan safer routes, check in with people you trust, and get real-time safety alerts for your area." />
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="" />
+    <title>SafeCircle — walk with confidence</title>
+    <script>
+      // Applied before React mounts so there's no flash of the wrong theme
+      // on load. Mirrors the logic in src/context/ThemeContext.jsx — keep
+      // the two in sync if that ever changes.
+      (function () {
+        try {
+          var stored = localStorage.getItem('sp_theme');
+          var pref = stored ? JSON.parse(stored) : 'system';
+          var dark = pref === 'dark' || (pref === 'system' && window.matchMedia('(prefers-color-scheme: dark)').matches);
+          document.documentElement.classList.toggle('dark', dark);
+        } catch {
+          // localStorage unavailable — fall back to whatever :root defaults to (light).
+        }
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>
