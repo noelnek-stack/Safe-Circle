@@ -18,61 +18,115 @@ function normalize(str) {
   return str.toLowerCase().replace(/[^a-z0-9\s]/g, '').trim()
 }
 
-// Checks whether a transcript contains the target phrase.
-// Does a direct substring match first, then a word-overlap fallback
-// (handles slight mis-transcriptions or reordered words).
-function phraseDetected(transcript, target) {
-  if (!transcript || !target) return false
-  const t = normalize(transcript)
-  const p = normalize(target)
-  if (!p) return false
+function wordsOf(str) {
+  return normalize(str).split(/\s+/).filter(Boolean)
+}
 
-  if (t.includes(p)) return true
-
-  const phraseWords = p.split(/\s+/).filter(Boolean)
-  if (phraseWords.length > 1) {
-    const transcriptWords = t.split(/\s+/)
-    return phraseWords.every((w) => transcriptWords.includes(w))
+// Word-boundary-aware contiguous match: "help" must not match inside "helping".
+function containsPhraseContiguous(transcriptWords, phraseWords) {
+  if (phraseWords.length === 0) return false
+  if (phraseWords.length === 1) {
+    return transcriptWords.includes(phraseWords[0])
   }
-
+  outer: for (let i = 0; i <= transcriptWords.length - phraseWords.length; i++) {
+    for (let j = 0; j < phraseWords.length; j++) {
+      if (transcriptWords[i + j] !== phraseWords[j]) continue outer
+    }
+    return true
+  }
   return false
 }
 
+// Ordered (not necessarily contiguous) match with a small gap budget.
+// Allows "red … phoenix" when the recognizer inserts a filler word or
+// splits the phrase across a brief pause, without matching arbitrary
+// distant occurrences of the individual words.
+function containsPhraseOrdered(transcriptWords, phraseWords, maxGap = 2) {
+  if (phraseWords.length === 0) return false
+  let ti = 0
+  for (let pi = 0; pi < phraseWords.length; pi++) {
+    let found = -1
+    const limit = ti + maxGap + 1
+    for (let k = ti; k < Math.min(limit, transcriptWords.length); k++) {
+      if (transcriptWords[k] === phraseWords[pi]) {
+        found = k
+        break
+      }
+    }
+    if (found < 0) return false
+    ti = found + 1
+  }
+  return true
+}
+
+// Checks whether a transcript (or combined recent buffer) contains the target
+// phrase. Prefers exact contiguous word sequence, then ordered match with
+// limited gaps. Single-word phrases require a whole-word match.
+function phraseDetected(transcript, target) {
+  if (!transcript || !target) return false
+  const phraseWords = wordsOf(target)
+  if (phraseWords.length === 0) return false
+
+  const transcriptWords = wordsOf(transcript)
+  if (transcriptWords.length === 0) return false
+
+  if (containsPhraseContiguous(transcriptWords, phraseWords)) return true
+  if (phraseWords.length > 1 && containsPhraseOrdered(transcriptWords, phraseWords, 2)) {
+    return true
+  }
+  return false
+}
+
+// How long (ms) recent final transcripts stay in the rolling buffer used for
+// cross-utterance detection. Covers a natural pause between words of a phrase.
+const TRANSCRIPT_BUFFER_MS = 6000
+
+// Ignore further detections for this long after a successful trigger so the
+// same utterance (or immediate echo) cannot fire SOS twice.
+const DETECT_COOLDOWN_MS = 8000
+
 // How long to wait (ms) before restarting recognition after it ends.
 // Keep this very short so the mic gap is imperceptible to the user.
-const RESTART_DELAY_MS = 150
+const RESTART_DELAY_MS = 80
 
 // On a genuine network hiccup, back off longer before retrying.
 const NETWORK_ERROR_BACKOFF_MS = 2000
+
+// If start() fails (e.g. still tearing down), retry after this delay.
+const START_RETRY_MS = 250
 
 export function VoiceSOSProvider({ children }) {
   const { voice, endCheckIn, contacts } = useSafety()
   const { user } = useAuth()
 
   // The person's *intent*: should listening be on? This is what persists.
+  // The UI mic button is driven from this so it never flickers when Chrome
+  // ends and restarts the underlying SpeechRecognition session.
   const [desiredActive, setDesiredActive] = useLocalStorage('sp_voice_desired_active', false)
 
-  const [isListening, setIsListening] = useState(false)
   const [triggered, setTriggered] = useState(false)
   const [sending, setSending] = useState(false)
   const [autoSent, setAutoSent] = useState(false)
   const [error, setError] = useState('')
   const [lastTranscript, setLastTranscript] = useState('')
-  // sessionActive tracks the underlying recognition session state.
-  // It cycles on/off as Chrome restarts sessions. We never expose this
-  // directly — the UI button uses desiredActive instead so it never flickers.
+  // True only while the underlying SpeechRecognition session is running.
+  // Used for the subtle pulse ring — not for the main on/off control.
   const [sessionActive, setSessionActive] = useState(false)
 
   const recognitionRef = useRef(null)
-  const restartingRef = useRef(false)
-  const restartTimerRef = useRef(null)   // holds the pending setTimeout id
-  const lastNetworkErrorRef = useRef(0)  // timestamp of last network error
-  // Tracks whether a session is truly active RIGHT NOW (not flickering
-  // during the restart gap). Used to keep isListening=true continuously.
+  // When true, onend will automatically restart the session.
+  // Cleared only when the user (or a fatal error) turns listening off.
+  const shouldRunRef = useRef(false)
+  const restartTimerRef = useRef(null)
+  const lastNetworkErrorRef = useRef(0)
   const isSessionActiveRef = useRef(false)
+  // Rolling buffer of recent final transcripts so a multi-word code phrase
+  // still matches when the recognizer splits it across separate finals.
+  const transcriptBufferRef = useRef([]) // [{ text, at }]
+  const lastDetectAtRef = useRef(0)
 
-  // Keep a ref to the latest voice/user/endCheckIn so handlers always see
-  // current values without the recognition useEffect ever needing to re-run.
+  // Keep refs to latest values so the one-time recognition effect never
+  // needs to re-subscribe.
   const voiceRef = useRef(voice)
   voiceRef.current = voice
 
@@ -89,7 +143,6 @@ export function VoiceSOSProvider({ children }) {
   const configured = !!voice.codeWord?.trim()
   const supported = !!SpeechRecognition
 
-  // Stable — reads everything via refs, never causes the effect to re-run.
   const sendSOS = useCallback(async () => {
     setSending(true)
     try {
@@ -118,46 +171,58 @@ export function VoiceSOSProvider({ children }) {
     }
   }, [])
 
-  // Schedule a delayed restart. Uses a ref so we can cancel any pending
-  // restart if the user manually stops listening.
+  // Attempt to start recognition. Retries once if the engine is still
+  // tearing down from a previous session (common right after onend).
+  function tryStart(recognition, attempt = 0) {
+    if (!shouldRunRef.current || !recognition) return
+    try {
+      recognition.start()
+    } catch {
+      if (attempt < 3 && shouldRunRef.current) {
+        clearTimeout(restartTimerRef.current)
+        restartTimerRef.current = setTimeout(
+          () => tryStart(recognition, attempt + 1),
+          START_RETRY_MS
+        )
+      }
+    }
+  }
+
   function scheduleRestart(recognition, delayMs) {
     clearTimeout(restartTimerRef.current)
     restartTimerRef.current = setTimeout(() => {
-      if (!restartingRef.current) return // user stopped while we were waiting
-      try {
-        recognition.start()
-      } catch {
-        // Already started — that's fine.
-      }
+      if (!shouldRunRef.current) return
+      tryStart(recognition)
     }, delayMs)
   }
 
   const startListening = useCallback(() => {
     if (!recognitionRef.current) return
     clearTimeout(restartTimerRef.current)
-    restartingRef.current = true
-    isSessionActiveRef.current = true
+    shouldRunRef.current = true
+    transcriptBufferRef.current = []
     setError('')
+    // Optimistically mark active; onstart will confirm.
     setSessionActive(true)
-    try {
-      recognitionRef.current.start()
-      setIsListening(true)
-    } catch {
-      // start() throws if already running — already on, that's fine.
-    }
+    tryStart(recognitionRef.current)
   }, [])
 
   const stopListening = useCallback(() => {
     if (!recognitionRef.current) return
     clearTimeout(restartTimerRef.current)
-    restartingRef.current = false
-    recognitionRef.current.stop()
-    setIsListening(false)
+    shouldRunRef.current = false
+    transcriptBufferRef.current = []
+    isSessionActiveRef.current = false
     setSessionActive(false)
     setLastTranscript('')
+    try {
+      recognitionRef.current.stop()
+    } catch {
+      // Not running — fine.
+    }
   }, [])
 
-  // Set up the recognizer ONCE. Never torn down while listening is active.
+  // Set up the recognizer ONCE. Never torn down while the provider is mounted.
   // All dynamic values are read via refs inside handlers.
   useEffect(() => {
     if (!supported) return
@@ -166,40 +231,63 @@ export function VoiceSOSProvider({ children }) {
     recognition.continuous = true
     // interimResults MUST be true — it keeps Chrome's WebSocket connection
     // alive between words so the session doesn't end after every utterance.
-    // Without it, Chrome closes the session constantly causing the mic to
-    // visibly cycle on/off every few seconds. We still only check isFinal
-    // results for phrase detection — interim results are only used to keep
-    // the connection alive and to show a live transcript in the UI.
     recognition.interimResults = true
     recognition.lang = 'en-US'
-    recognition.maxAlternatives = 3 // Try top-3 transcription guesses
+    recognition.maxAlternatives = 3
+
+    recognition.onstart = () => {
+      isSessionActiveRef.current = true
+      setSessionActive(true)
+      setError((prev) => (prev && prev.startsWith('Voice detection paused') ? '' : prev))
+      console.debug('[VoiceSOS] session started')
+    }
 
     recognition.onresult = (event) => {
       const target = voiceRef.current.codeWord || ''
       if (!target.trim()) return
 
+      const now = Date.now()
+      transcriptBufferRef.current = transcriptBufferRef.current.filter(
+        (e) => now - e.at <= TRANSCRIPT_BUFFER_MS
+      )
+
       for (let i = event.resultIndex; i < event.results.length; i++) {
         const result = event.results[i]
 
-        // Always show the best live transcript (interim or final) in the UI.
         if (result[0]) setLastTranscript(result[0].transcript)
 
-        // Only check for the phrase in FINAL (committed) results.
         if (!result.isFinal) continue
 
+        if (now - lastDetectAtRef.current < DETECT_COOLDOWN_MS) continue
+
+        if (result[0]) {
+          transcriptBufferRef.current.push({ text: result[0].transcript, at: now })
+        }
+        const combined = transcriptBufferRef.current.map((e) => e.text).join(' ')
+
+        let matched = false
         for (let j = 0; j < result.length; j++) {
           const transcript = result[j].transcript
           console.debug('[VoiceSOS] final:', JSON.stringify(transcript), '| target:', JSON.stringify(target))
-
           if (phraseDetected(transcript, target)) {
-            console.info('[VoiceSOS] ✅ Code phrase detected!')
-            if (voiceRef.current.autoSendOnDetect) {
-              sendSOS()
-            } else {
-              setTriggered(true)
-            }
-            return
+            matched = true
+            break
           }
+        }
+        if (!matched && phraseDetected(combined, target)) {
+          matched = true
+        }
+
+        if (matched) {
+          console.info('[VoiceSOS] ✅ Code phrase detected!')
+          lastDetectAtRef.current = now
+          transcriptBufferRef.current = []
+          if (voiceRef.current.autoSendOnDetect) {
+            sendSOS()
+          } else {
+            setTriggered(true)
+          }
+          return
         }
       }
     }
@@ -208,52 +296,49 @@ export function VoiceSOSProvider({ children }) {
       console.warn('[VoiceSOS] recognition error:', event.error)
 
       if (event.error === 'aborted') {
-        // Aborted by us (e.g. during restart) — not a real error, ignore.
+        // Aborted by us (stop / restart) — not a real error.
         return
       }
 
       if (event.error === 'no-speech') {
-        // No speech detected in the current window — perfectly normal,
-        // the recognizer will end and onend will restart it.
+        // Normal silence window; onend will restart if shouldRunRef is true.
         return
       }
 
       if (event.error === 'network') {
-        // Chrome returns "network" when the speech session is restarted
-        // too quickly, or when Google's servers briefly hiccup. This is
-        // almost always transient — do NOT show it to the user as a fatal
-        // error. Instead, back off and let onend restart it automatically.
+        // Transient: restarting too quickly or a brief server hiccup.
         lastNetworkErrorRef.current = Date.now()
-        console.warn('[VoiceSOS] Transient network error — will retry automatically after backoff.')
+        console.warn('[VoiceSOS] Transient network error — will retry after backoff.')
         return
       }
 
       if (event.error === 'not-allowed') {
         setError('Microphone permission was denied. Allow mic access in your browser settings to use Voice SOS.')
-        restartingRef.current = false // fatal — don't retry
-        setIsListening(false)
+        shouldRunRef.current = false
+        setDesiredActive(false)
+        isSessionActiveRef.current = false
+        setSessionActive(false)
         return
       }
 
-      // For any other error, show a message but still try to recover.
-      setError(`Voice detection paused (${event.error}) — retrying…`)
+      // Other errors: surface a soft message; onend still restarts if desired.
+      if (shouldRunRef.current) {
+        setError(`Voice detection paused (${event.error}) — retrying…`)
+      }
     }
 
-    // Chrome's recognizer stops itself after silence or a network hiccup.
-    // We restart it automatically. Crucially, we do NOT set isListening=false
-    // during the restart gap — the mic appears to stay on continuously.
+    // Chrome ends continuous sessions after silence, network blips, or
+    // internal timeouts. As long as the user still wants listening on
+    // (shouldRunRef), restart immediately without flipping the main UI off.
     recognition.onend = () => {
       isSessionActiveRef.current = false
       setSessionActive(false)
 
-      if (!restartingRef.current) {
-        setIsListening(false)
+      if (!shouldRunRef.current) {
+        console.debug('[VoiceSOS] session ended — listening is off, not restarting')
         return
       }
 
-      // Keep isListening=true so the UI doesn't flicker during the restart gap.
-      // The actual mic is briefly off for RESTART_DELAY_MS but the user won't
-      // see or hear it as a toggle.
       const timeSinceNetworkError = Date.now() - lastNetworkErrorRef.current
       const delay = timeSinceNetworkError < 3000
         ? NETWORK_ERROR_BACKOFF_MS
@@ -265,33 +350,54 @@ export function VoiceSOSProvider({ children }) {
 
     recognitionRef.current = recognition
 
-    // Auto-resume if listening was on before (page reload / tab switch).
+    // Auto-resume if listening was on before (page reload / provider remount).
     if (desiredActiveRef.current) {
-      restartingRef.current = true
-      isSessionActiveRef.current = true
-      setIsListening(true)
-      setSessionActive(true)
+      shouldRunRef.current = true
       scheduleRestart(recognition, RESTART_DELAY_MS)
     }
 
     return () => {
+      // Critical: detach handlers BEFORE stop() so the resulting onend does
+      // not run our logic with shouldRunRef already false (that was causing
+      // isListening / UI flicker on React Strict Mode remounts and HMR).
       clearTimeout(restartTimerRef.current)
-      restartingRef.current = false
-      recognition.stop()
-      setTimeout(() => {
-        recognition.onresult = null
-        recognition.onerror = null
-        recognition.onend = null
-      }, 300)
+      shouldRunRef.current = false
+      recognition.onstart = null
+      recognition.onresult = null
+      recognition.onerror = null
+      recognition.onend = null
+      try {
+        recognition.stop()
+      } catch {
+        // ignore
+      }
+      recognitionRef.current = null
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [supported]) // Only runs once — never recreated while listening
+  }, [supported])
 
-  // Resume listening when the tab becomes visible again.
+  // Keep shouldRunRef in sync when desiredActive changes from outside
+  // (e.g. localStorage hydrate) and resume if needed.
+  useEffect(() => {
+    if (desiredActive) {
+      if (!shouldRunRef.current) {
+        startListening()
+      }
+    } else if (shouldRunRef.current) {
+      stopListening()
+    }
+  }, [desiredActive, startListening, stopListening])
+
+  // Resume when the tab becomes visible again (Chrome often kills the
+  // speech session while backgrounded).
   useEffect(() => {
     function handleVisibility() {
-      if (document.visibilityState === 'visible' && desiredActive && !isListening) {
-        startListening()
+      if (document.visibilityState !== 'visible') return
+      if (!desiredActiveRef.current) return
+      // Force a restart if the session is not currently active.
+      if (!isSessionActiveRef.current && recognitionRef.current) {
+        shouldRunRef.current = true
+        scheduleRestart(recognitionRef.current, RESTART_DELAY_MS)
       }
     }
     document.addEventListener('visibilitychange', handleVisibility)
@@ -300,10 +406,10 @@ export function VoiceSOSProvider({ children }) {
       document.removeEventListener('visibilitychange', handleVisibility)
       window.removeEventListener('focus', handleVisibility)
     }
-  }, [desiredActive, isListening, startListening])
+  }, [])
 
   function toggleListening() {
-    if (isListening) {
+    if (desiredActive) {
       setDesiredActive(false)
       stopListening()
     } else {
@@ -316,11 +422,10 @@ export function VoiceSOSProvider({ children }) {
   }
 
   const value = {
-    // isListening = the user's intent (desiredActive). Stays true the whole
-    // time the user wants listening on, regardless of session cycling.
-    // This is what drives the mic button visual — it never flickers.
-    isListening,
-    sessionActive,   // true only when the underlying session is actually running
+    // Driven by user intent (desiredActive), not by Chrome's session cycling.
+    // Stays true until the user turns listening off (or mic permission fails).
+    isListening: desiredActive,
+    sessionActive,
     triggered, sending, autoSent, error,
     supported, configured, priorityCount,
     lastTranscript,
