@@ -1,5 +1,5 @@
 import { Link } from 'react-router-dom'
-import { Mic, MicOff, AlertOctagon, Settings as SettingsIcon } from 'lucide-react'
+import { Mic, MicOff, AlertOctagon, AlertTriangle, Settings as SettingsIcon } from 'lucide-react'
 import { useSafety } from '../context/SafetyContext'
 import { useVoiceSOS } from '../context/VoiceSOSContext'
 
@@ -7,7 +7,7 @@ export default function VoiceSOS() {
   const { voice } = useSafety()
   const {
     isListening, sessionActive, triggered, sending, autoSent, error,
-    supported, configured, priorityCount, lastTranscript,
+    supported, configured, priorityCount, priorityWithEmailCount, lastTranscript,
     toggleListening, sendSOS, setTriggered,
   } = useVoiceSOS()
 
@@ -32,6 +32,20 @@ export default function VoiceSOS() {
           <span>Choose a code phrase in Settings before you can start listening.</span>
           <Link to="/settings" className="flex shrink-0 items-center gap-1 rounded-lg bg-[var(--amber)] px-3 py-1.5 text-xs font-semibold text-white">
             <SettingsIcon size={13} /> Settings
+          </Link>
+        </div>
+      )}
+
+      {supported && configured && priorityWithEmailCount === 0 && (
+        <div className="mt-6 flex items-center justify-between gap-3 rounded-xl border border-[var(--amber)]/40 bg-[var(--amber-soft)] px-4 py-3 text-sm text-[var(--amber)]">
+          <span className="flex items-center gap-2">
+            <AlertTriangle size={15} className="shrink-0" />
+            {priorityCount === 0
+              ? "No priority contacts yet — nobody will be emailed if your code phrase is detected."
+              : "Your priority contacts don't have an email saved — nobody will be emailed if your code phrase is detected."}
+          </span>
+          <Link to="/contacts" className="flex shrink-0 items-center gap-1 rounded-lg bg-[var(--amber)] px-3 py-1.5 text-xs font-semibold text-white">
+            Fix contacts
           </Link>
         </div>
       )}

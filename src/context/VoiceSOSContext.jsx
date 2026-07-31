@@ -118,6 +118,12 @@ export function VoiceSOSProvider({ children }) {
   // Cleared only when the user (or a fatal error) turns listening off.
   const shouldRunRef = useRef(false)
   const restartTimerRef = useRef(null)
+  // Debounces the "session active" UI indicator (pulse ring) so a quick
+  // onend -> restart -> onstart cycle (the common case, ~80-250ms) doesn't
+  // visibly flash the indicator off and back on. Only shown as "paused" if
+  // the gap actually lasts long enough for a person to notice.
+  const sessionOffTimerRef = useRef(null)
+  const SESSION_OFF_DEBOUNCE_MS = 350
   const lastNetworkErrorRef = useRef(0)
   const isSessionActiveRef = useRef(false)
   // Rolling buffer of recent final transcripts so a multi-word code phrase
@@ -140,6 +146,11 @@ export function VoiceSOSProvider({ children }) {
   desiredActiveRef.current = desiredActive
 
   const priorityCount = contacts.filter((c) => c.priority).length
+  // Contacts that would actually receive an SOS email — priority AND has an
+  // email saved. This is what the server actually emails on detection, so
+  // it's what the UI should warn about (having priority contacts with no
+  // email looks "set up" but silently notifies nobody).
+  const priorityWithEmailCount = contacts.filter((c) => c.priority && c.email && c.email.trim()).length
   const configured = !!voice.codeWord?.trim()
   const supported = !!SpeechRecognition
 
@@ -210,6 +221,7 @@ export function VoiceSOSProvider({ children }) {
   const stopListening = useCallback(() => {
     if (!recognitionRef.current) return
     clearTimeout(restartTimerRef.current)
+    clearTimeout(sessionOffTimerRef.current)
     shouldRunRef.current = false
     transcriptBufferRef.current = []
     isSessionActiveRef.current = false
@@ -237,6 +249,7 @@ export function VoiceSOSProvider({ children }) {
 
     recognition.onstart = () => {
       isSessionActiveRef.current = true
+      clearTimeout(sessionOffTimerRef.current)
       setSessionActive(true)
       setError((prev) => (prev && prev.startsWith('Voice detection paused') ? '' : prev))
       console.debug('[VoiceSOS] session started')
@@ -332,7 +345,13 @@ export function VoiceSOSProvider({ children }) {
     // (shouldRunRef), restart immediately without flipping the main UI off.
     recognition.onend = () => {
       isSessionActiveRef.current = false
-      setSessionActive(false)
+      // Don't flip the visible indicator off immediately — most restarts
+      // land well inside this window and onstart will cancel the timer
+      // before it fires, so the UI never shows the blip at all.
+      clearTimeout(sessionOffTimerRef.current)
+      sessionOffTimerRef.current = setTimeout(() => {
+        if (!isSessionActiveRef.current) setSessionActive(false)
+      }, SESSION_OFF_DEBOUNCE_MS)
 
       if (!shouldRunRef.current) {
         console.debug('[VoiceSOS] session ended — listening is off, not restarting')
@@ -361,6 +380,7 @@ export function VoiceSOSProvider({ children }) {
       // not run our logic with shouldRunRef already false (that was causing
       // isListening / UI flicker on React Strict Mode remounts and HMR).
       clearTimeout(restartTimerRef.current)
+      clearTimeout(sessionOffTimerRef.current)
       shouldRunRef.current = false
       recognition.onstart = null
       recognition.onresult = null
@@ -427,7 +447,7 @@ export function VoiceSOSProvider({ children }) {
     isListening: desiredActive,
     sessionActive,
     triggered, sending, autoSent, error,
-    supported, configured, priorityCount,
+    supported, configured, priorityCount, priorityWithEmailCount,
     lastTranscript,
     toggleListening, sendSOS,
     setTriggered,
