@@ -7,7 +7,7 @@ export default function VoiceSOS() {
   const { voice } = useSafety()
   const {
     isListening, triggered, sending, autoSent, error,
-    supported, configured, priorityCount,
+    supported, configured, priorityCount, lastTranscript,
     toggleListening, sendSOS, setTriggered,
   } = useVoiceSOS()
 
@@ -89,6 +89,22 @@ export default function VoiceSOS() {
           <p className="mt-2 text-[11px] font-medium text-[var(--signal-deep)]">Auto-send is ON — no confirmation step.</p>
         )}
       </div>
+
+      {/* Live transcript debug panel — shown only while listening */}
+      {isListening && (
+        <div className="mt-4 rounded-xl border border-[var(--line)] bg-[var(--paper)] px-4 py-3">
+          <p className="text-[11px] font-semibold uppercase tracking-wide text-[var(--ink-soft)]">What the mic is hearing</p>
+          <p className="mt-1 min-h-[1.5rem] text-sm text-[var(--ink)]">
+            {lastTranscript
+              ? <span>"{lastTranscript}"</span>
+              : <span className="text-[var(--ink-soft)] italic">Waiting for speech…</span>
+            }
+          </p>
+          <p className="mt-1 text-[10px] text-[var(--ink-soft)]">
+            Speak naturally — say your code phrase: <strong>"{voice.codeWord}"</strong>
+          </p>
+        </div>
+      )}
     </div>
   )
 }
