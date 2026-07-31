@@ -39,10 +39,8 @@ function phraseDetected(transcript, target) {
 }
 
 // How long to wait (ms) before restarting recognition after it ends.
-// Chrome's speech servers rate-limit rapid reconnects and return a
-// "network" error when start() is called too quickly after the previous
-// session ended. A short pause avoids this entirely.
-const RESTART_DELAY_MS = 300
+// Keep this very short so the mic gap is imperceptible to the user.
+const RESTART_DELAY_MS = 150
 
 // On a genuine network hiccup, back off longer before retrying.
 const NETWORK_ERROR_BACKOFF_MS = 2000
@@ -63,8 +61,11 @@ export function VoiceSOSProvider({ children }) {
 
   const recognitionRef = useRef(null)
   const restartingRef = useRef(false)
-  const restartTimerRef = useRef(null)  // holds the pending setTimeout id
-  const lastNetworkErrorRef = useRef(0) // timestamp of last network error
+  const restartTimerRef = useRef(null)   // holds the pending setTimeout id
+  const lastNetworkErrorRef = useRef(0)  // timestamp of last network error
+  // Tracks whether a session is truly active RIGHT NOW (not flickering
+  // during the restart gap). Used to keep isListening=true continuously.
+  const isSessionActiveRef = useRef(false)
 
   // Keep a ref to the latest voice/user/endCheckIn so handlers always see
   // current values without the recognition useEffect ever needing to re-run.
@@ -131,6 +132,7 @@ export function VoiceSOSProvider({ children }) {
     if (!recognitionRef.current) return
     clearTimeout(restartTimerRef.current)
     restartingRef.current = true
+    isSessionActiveRef.current = true
     setError('')
     try {
       recognitionRef.current.start()
@@ -155,11 +157,13 @@ export function VoiceSOSProvider({ children }) {
 
     const recognition = new SpeechRecognition()
     recognition.continuous = true
-    // Only fire onresult for FINAL results — not partial/interim words.
-    // Interim results cause "network" errors by keeping the connection open
-    // too long and can also produce incomplete phrase fragments that block
-    // real matches.
-    recognition.interimResults = false
+    // interimResults MUST be true — it keeps Chrome's WebSocket connection
+    // alive between words so the session doesn't end after every utterance.
+    // Without it, Chrome closes the session constantly causing the mic to
+    // visibly cycle on/off every few seconds. We still only check isFinal
+    // results for phrase detection — interim results are only used to keep
+    // the connection alive and to show a live transcript in the UI.
+    recognition.interimResults = true
     recognition.lang = 'en-US'
     recognition.maxAlternatives = 3 // Try top-3 transcription guesses
 
@@ -169,12 +173,16 @@ export function VoiceSOSProvider({ children }) {
 
       for (let i = event.resultIndex; i < event.results.length; i++) {
         const result = event.results[i]
+
+        // Always show the best live transcript (interim or final) in the UI.
+        if (result[0]) setLastTranscript(result[0].transcript)
+
+        // Only check for the phrase in FINAL (committed) results.
         if (!result.isFinal) continue
 
         for (let j = 0; j < result.length; j++) {
           const transcript = result[j].transcript
-          if (j === 0) setLastTranscript(transcript)
-          console.debug('[VoiceSOS] heard:', JSON.stringify(transcript), '| target:', JSON.stringify(target))
+          console.debug('[VoiceSOS] final:', JSON.stringify(transcript), '| target:', JSON.stringify(target))
 
           if (phraseDetected(transcript, target)) {
             console.info('[VoiceSOS] ✅ Code phrase detected!')
@@ -224,16 +232,20 @@ export function VoiceSOSProvider({ children }) {
       setError(`Voice detection paused (${event.error}) — retrying…`)
     }
 
-    // Chrome's recognizer stops itself after a period of silence (or after a
-    // network error). We restart it automatically with a small delay to avoid
-    // hammering Google's speech servers, which is what causes "network" errors.
+    // Chrome's recognizer stops itself after silence or a network hiccup.
+    // We restart it automatically. Crucially, we do NOT set isListening=false
+    // during the restart gap — the mic appears to stay on continuously.
     recognition.onend = () => {
+      isSessionActiveRef.current = false
+
       if (!restartingRef.current) {
         setIsListening(false)
         return
       }
 
-      // If we recently got a network error, back off longer before retrying.
+      // Keep isListening=true so the UI doesn't flicker during the restart gap.
+      // The actual mic is briefly off for RESTART_DELAY_MS but the user won't
+      // see or hear it as a toggle.
       const timeSinceNetworkError = Date.now() - lastNetworkErrorRef.current
       const delay = timeSinceNetworkError < 3000
         ? NETWORK_ERROR_BACKOFF_MS
@@ -248,6 +260,7 @@ export function VoiceSOSProvider({ children }) {
     // Auto-resume if listening was on before (page reload / tab switch).
     if (desiredActiveRef.current) {
       restartingRef.current = true
+      isSessionActiveRef.current = true
       scheduleRestart(recognition, RESTART_DELAY_MS)
       setIsListening(true)
     }
