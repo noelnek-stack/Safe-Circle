@@ -28,8 +28,8 @@ function getMessagingInstance() {
 }
 
 // Asks the browser for notification permission, registers the service
-// worker, and returns an FCM device token for this browser. Throws with a
-// readable message if any step fails or isn't supported.
+// worker, waits for it to become active, and returns an FCM device token
+// for this browser. Throws with a readable message if any step fails.
 export async function requestPushToken() {
   const messaging = await getMessagingInstance()
   if (!messaging) {
@@ -38,18 +38,33 @@ export async function requestPushToken() {
   if (!('Notification' in window)) {
     throw new Error('This browser does not support notifications.')
   }
+  if (!('serviceWorker' in navigator)) {
+    throw new Error('Service Workers are not supported in this browser.')
+  }
 
   const permission = await Notification.requestPermission()
   if (permission !== 'granted') {
     throw new Error('Notification permission was not granted.')
   }
 
-  const registration = await navigator.serviceWorker.register('/firebase-messaging-sw.js')
+  // Register the service worker and wait for it to be fully active.
+  // Firebase's getToken() calls PushManager.subscribe() internally, which
+  // requires the SW to be in the "activated" state — not just "installing".
+  // Using navigator.serviceWorker.ready guarantees activation before we
+  // ask for the FCM token, which prevents the "no active Service Worker" error.
+  const registration = await navigator.serviceWorker.register('/firebase-messaging-sw.js', {
+    scope: '/',
+  })
+
+  // Wait for the SW to become active (handles the case where it is still
+  // installing on the very first page load).
+  await navigator.serviceWorker.ready
+
   const vapidKey = import.meta.env.VITE_FIREBASE_VAPID_KEY
 
   const token = await getToken(messaging, { vapidKey, serviceWorkerRegistration: registration })
   if (!token) {
-    throw new Error('Could not get a push token from Firebase.')
+    throw new Error('Could not get a push token from Firebase. Make sure your VAPID key is correct and the site is served over HTTPS.')
   }
   return token
 }
