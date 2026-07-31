@@ -58,6 +58,10 @@ export function VoiceSOSProvider({ children }) {
   const [autoSent, setAutoSent] = useState(false)
   const [error, setError] = useState('')
   const [lastTranscript, setLastTranscript] = useState('')
+  // sessionActive tracks the underlying recognition session state.
+  // It cycles on/off as Chrome restarts sessions. We never expose this
+  // directly — the UI button uses desiredActive instead so it never flickers.
+  const [sessionActive, setSessionActive] = useState(false)
 
   const recognitionRef = useRef(null)
   const restartingRef = useRef(false)
@@ -134,6 +138,7 @@ export function VoiceSOSProvider({ children }) {
     restartingRef.current = true
     isSessionActiveRef.current = true
     setError('')
+    setSessionActive(true)
     try {
       recognitionRef.current.start()
       setIsListening(true)
@@ -148,6 +153,8 @@ export function VoiceSOSProvider({ children }) {
     restartingRef.current = false
     recognitionRef.current.stop()
     setIsListening(false)
+    setSessionActive(false)
+    setLastTranscript('')
   }, [])
 
   // Set up the recognizer ONCE. Never torn down while listening is active.
@@ -237,6 +244,7 @@ export function VoiceSOSProvider({ children }) {
     // during the restart gap — the mic appears to stay on continuously.
     recognition.onend = () => {
       isSessionActiveRef.current = false
+      setSessionActive(false)
 
       if (!restartingRef.current) {
         setIsListening(false)
@@ -261,8 +269,9 @@ export function VoiceSOSProvider({ children }) {
     if (desiredActiveRef.current) {
       restartingRef.current = true
       isSessionActiveRef.current = true
-      scheduleRestart(recognition, RESTART_DELAY_MS)
       setIsListening(true)
+      setSessionActive(true)
+      scheduleRestart(recognition, RESTART_DELAY_MS)
     }
 
     return () => {
@@ -307,7 +316,12 @@ export function VoiceSOSProvider({ children }) {
   }
 
   const value = {
-    isListening, triggered, sending, autoSent, error,
+    // isListening = the user's intent (desiredActive). Stays true the whole
+    // time the user wants listening on, regardless of session cycling.
+    // This is what drives the mic button visual — it never flickers.
+    isListening,
+    sessionActive,   // true only when the underlying session is actually running
+    triggered, sending, autoSent, error,
     supported, configured, priorityCount,
     lastTranscript,
     toggleListening, sendSOS,

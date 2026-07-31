@@ -6,7 +6,7 @@ import { useVoiceSOS } from '../context/VoiceSOSContext'
 export default function VoiceSOS() {
   const { voice } = useSafety()
   const {
-    isListening, triggered, sending, autoSent, error,
+    isListening, sessionActive, triggered, sending, autoSent, error,
     supported, configured, priorityCount, lastTranscript,
     toggleListening, sendSOS, setTriggered,
   } = useVoiceSOS()
@@ -76,7 +76,7 @@ export default function VoiceSOS() {
             isListening ? 'bg-[var(--moss)] text-white' : 'bg-[var(--moss-soft)] text-[var(--moss-deep)]'
           }`}
         >
-          {isListening && <span className="pulse-ring absolute inset-0 text-[var(--moss)]" />}
+          {isListening && sessionActive && <span className="pulse-ring absolute inset-0 text-[var(--moss)]" />}
           {isListening ? <Mic size={28} /> : <MicOff size={28} />}
         </button>
         <p className="mt-4 text-sm font-medium">
