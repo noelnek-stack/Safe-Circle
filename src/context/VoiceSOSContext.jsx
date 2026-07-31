@@ -19,20 +19,16 @@ function normalize(str) {
 }
 
 // Checks whether a transcript contains the target phrase.
-// Uses a word-boundary aware match so "help" doesn't match "helpful",
-// but is forgiving enough to catch slight mis-transcriptions by also
-// doing a token-overlap check (useful for multi-word phrases).
+// Does a direct substring match first, then a word-overlap fallback
+// (handles slight mis-transcriptions or reordered words).
 function phraseDetected(transcript, target) {
   if (!transcript || !target) return false
   const t = normalize(transcript)
   const p = normalize(target)
   if (!p) return false
 
-  // Direct substring match (covers most cases).
   if (t.includes(p)) return true
 
-  // Token overlap: if the phrase has multiple words, check that all
-  // words appear somewhere in the transcript (handles reordering/extra words).
   const phraseWords = p.split(/\s+/).filter(Boolean)
   if (phraseWords.length > 1) {
     const transcriptWords = t.split(/\s+/)
@@ -42,11 +38,15 @@ function phraseDetected(transcript, target) {
   return false
 }
 
-// This provider is mounted once, above the app's routes, so the recognizer
-// it owns keeps running no matter which page is on screen. Listening state
-// is also persisted to localStorage, so it survives full page reloads and
-// browser tab switches too — it only ever turns off if the person taps the
-// mic to turn it off themselves.
+// How long to wait (ms) before restarting recognition after it ends.
+// Chrome's speech servers rate-limit rapid reconnects and return a
+// "network" error when start() is called too quickly after the previous
+// session ended. A short pause avoids this entirely.
+const RESTART_DELAY_MS = 300
+
+// On a genuine network hiccup, back off longer before retrying.
+const NETWORK_ERROR_BACKOFF_MS = 2000
+
 export function VoiceSOSProvider({ children }) {
   const { voice, endCheckIn, contacts } = useSafety()
   const { user } = useAuth()
@@ -63,10 +63,11 @@ export function VoiceSOSProvider({ children }) {
 
   const recognitionRef = useRef(null)
   const restartingRef = useRef(false)
+  const restartTimerRef = useRef(null)  // holds the pending setTimeout id
+  const lastNetworkErrorRef = useRef(0) // timestamp of last network error
 
-  // Keep a ref to the latest voice/user/endCheckIn so the recognition
-  // onresult handler always sees current values without ever being
-  // recreated (which would destroy the running recognition instance).
+  // Keep a ref to the latest voice/user/endCheckIn so handlers always see
+  // current values without the recognition useEffect ever needing to re-run.
   const voiceRef = useRef(voice)
   voiceRef.current = voice
 
@@ -83,8 +84,7 @@ export function VoiceSOSProvider({ children }) {
   const configured = !!voice.codeWord?.trim()
   const supported = !!SpeechRecognition
 
-  // sendSOS is stable — it reads current values via refs so it never
-  // needs to be recreated and never causes the recognition useEffect to re-run.
+  // Stable — reads everything via refs, never causes the effect to re-run.
   const sendSOS = useCallback(async () => {
     setSending(true)
     try {
@@ -97,7 +97,7 @@ export function VoiceSOSProvider({ children }) {
         lng = position.coords.longitude
         accuracy = position.coords.accuracy
       } catch {
-        // Location permission denied or unavailable — still send the alert.
+        // Location unavailable — still send the alert.
       }
 
       if (userRef.current) {
@@ -111,57 +111,70 @@ export function VoiceSOSProvider({ children }) {
     } finally {
       setSending(false)
     }
-  }, []) // No deps — reads everything via refs
+  }, [])
+
+  // Schedule a delayed restart. Uses a ref so we can cancel any pending
+  // restart if the user manually stops listening.
+  function scheduleRestart(recognition, delayMs) {
+    clearTimeout(restartTimerRef.current)
+    restartTimerRef.current = setTimeout(() => {
+      if (!restartingRef.current) return // user stopped while we were waiting
+      try {
+        recognition.start()
+      } catch {
+        // Already started — that's fine.
+      }
+    }, delayMs)
+  }
 
   const startListening = useCallback(() => {
     if (!recognitionRef.current) return
+    clearTimeout(restartTimerRef.current)
     restartingRef.current = true
+    setError('')
     try {
       recognitionRef.current.start()
       setIsListening(true)
     } catch {
-      // start() throws if already started — that's fine, it's already on.
+      // start() throws if already running — already on, that's fine.
     }
   }, [])
 
   const stopListening = useCallback(() => {
     if (!recognitionRef.current) return
+    clearTimeout(restartTimerRef.current)
     restartingRef.current = false
     recognitionRef.current.stop()
     setIsListening(false)
   }, [])
 
-  // Set up the recognizer ONCE (empty deps) so it is never torn down and
-  // recreated while listening is active. All dynamic values (code phrase,
-  // user, autoSendOnDetect) are read via refs inside the handlers so they
-  // always see the latest values without needing the effect to re-run.
+  // Set up the recognizer ONCE. Never torn down while listening is active.
+  // All dynamic values are read via refs inside handlers.
   useEffect(() => {
     if (!supported) return
 
     const recognition = new SpeechRecognition()
     recognition.continuous = true
-    // Use only FINAL results for matching — interim results are incomplete
-    // mid-word fragments that cause missed detections and false negatives.
+    // Only fire onresult for FINAL results — not partial/interim words.
+    // Interim results cause "network" errors by keeping the connection open
+    // too long and can also produce incomplete phrase fragments that block
+    // real matches.
     recognition.interimResults = false
     recognition.lang = 'en-US'
-    recognition.maxAlternatives = 3 // Check top-3 alternatives for robustness
+    recognition.maxAlternatives = 3 // Try top-3 transcription guesses
 
     recognition.onresult = (event) => {
       const target = voiceRef.current.codeWord || ''
       if (!target.trim()) return
 
-      // Only iterate over NEW results from this event batch.
       for (let i = event.resultIndex; i < event.results.length; i++) {
         const result = event.results[i]
-        // Skip interim results (belt-and-suspenders — interimResults=false
-        // should prevent these, but be safe).
         if (!result.isFinal) continue
 
-        // Check each alternative transcript (up to maxAlternatives).
         for (let j = 0; j < result.length; j++) {
           const transcript = result[j].transcript
-          if (j === 0) setLastTranscript(transcript) // Show best guess in UI
-          console.debug('[VoiceSOS] heard:', transcript, '| looking for:', target)
+          if (j === 0) setLastTranscript(transcript)
+          console.debug('[VoiceSOS] heard:', JSON.stringify(transcript), '| target:', JSON.stringify(target))
 
           if (phraseDetected(transcript, target)) {
             console.info('[VoiceSOS] ✅ Code phrase detected!')
@@ -170,62 +183,89 @@ export function VoiceSOSProvider({ children }) {
             } else {
               setTriggered(true)
             }
-            return // Don't process further results once triggered
+            return
           }
         }
       }
     }
 
     recognition.onerror = (event) => {
-      // 'no-speech' and 'aborted' are expected during normal operation.
-      if (event.error === 'no-speech' || event.error === 'aborted') return
-      console.warn('[VoiceSOS] error:', event.error)
-      setError(event.error === 'not-allowed'
-        ? 'Microphone permission was denied. Allow mic access in your browser settings to use Voice SOS.'
-        : `Voice detection error: ${event.error}`)
+      console.warn('[VoiceSOS] recognition error:', event.error)
+
+      if (event.error === 'aborted') {
+        // Aborted by us (e.g. during restart) — not a real error, ignore.
+        return
+      }
+
+      if (event.error === 'no-speech') {
+        // No speech detected in the current window — perfectly normal,
+        // the recognizer will end and onend will restart it.
+        return
+      }
+
+      if (event.error === 'network') {
+        // Chrome returns "network" when the speech session is restarted
+        // too quickly, or when Google's servers briefly hiccup. This is
+        // almost always transient — do NOT show it to the user as a fatal
+        // error. Instead, back off and let onend restart it automatically.
+        lastNetworkErrorRef.current = Date.now()
+        console.warn('[VoiceSOS] Transient network error — will retry automatically after backoff.')
+        return
+      }
+
+      if (event.error === 'not-allowed') {
+        setError('Microphone permission was denied. Allow mic access in your browser settings to use Voice SOS.')
+        restartingRef.current = false // fatal — don't retry
+        setIsListening(false)
+        return
+      }
+
+      // For any other error, show a message but still try to recover.
+      setError(`Voice detection paused (${event.error}) — retrying…`)
     }
 
-    // Chrome's recognizer stops itself after a period of silence, and
-    // browsers may also pause/kill it while the tab is hidden. Restart it
-    // automatically so listening feels continuous, unless the person
-    // explicitly turned it off.
+    // Chrome's recognizer stops itself after a period of silence (or after a
+    // network error). We restart it automatically with a small delay to avoid
+    // hammering Google's speech servers, which is what causes "network" errors.
     recognition.onend = () => {
-      if (restartingRef.current) {
-        try { recognition.start() } catch { /* already starting */ }
-      } else {
+      if (!restartingRef.current) {
         setIsListening(false)
+        return
       }
+
+      // If we recently got a network error, back off longer before retrying.
+      const timeSinceNetworkError = Date.now() - lastNetworkErrorRef.current
+      const delay = timeSinceNetworkError < 3000
+        ? NETWORK_ERROR_BACKOFF_MS
+        : RESTART_DELAY_MS
+
+      console.debug('[VoiceSOS] session ended — restarting in', delay, 'ms')
+      scheduleRestart(recognition, delay)
     }
 
     recognitionRef.current = recognition
 
-    // Resume listening automatically if it was on before (e.g. a page
-    // reload, or the browser fully tore down recognition while the tab was
-    // in the background) — as long as it wasn't manually turned off.
+    // Auto-resume if listening was on before (page reload / tab switch).
     if (desiredActiveRef.current) {
       restartingRef.current = true
-      try { recognition.start(); setIsListening(true) } catch { /* already started */ }
+      scheduleRestart(recognition, RESTART_DELAY_MS)
+      setIsListening(true)
     }
 
     return () => {
-      // Stop the instance cleanly. Do NOT null out onend before stopping —
-      // onend fires asynchronously after stop(), and we need it to NOT
-      // restart (restartingRef is already false at this point).
+      clearTimeout(restartTimerRef.current)
       restartingRef.current = false
       recognition.stop()
-      // Null handlers after stopping to prevent stale callbacks.
       setTimeout(() => {
         recognition.onresult = null
         recognition.onerror = null
         recognition.onend = null
-      }, 200)
+      }, 300)
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [supported]) // ← ONLY depends on `supported`, never recreated while listening
+  }, [supported]) // Only runs once — never recreated while listening
 
-  // If the tab becomes visible again (person switched back to this browser
-  // tab, or came back from another app) and listening should be on but
-  // isn't actually running right now, restart it.
+  // Resume listening when the tab becomes visible again.
   useEffect(() => {
     function handleVisibility() {
       if (document.visibilityState === 'visible' && desiredActive && !isListening) {
